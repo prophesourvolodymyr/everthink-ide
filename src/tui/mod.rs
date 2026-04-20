@@ -2,9 +2,11 @@
 
 pub mod chat;
 pub mod input;
+pub mod picker;
 pub mod status;
 
 use chat::{ChatMessage, MessageRole};
+use picker::{Picker, PickerItem, PickerKind};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::{
@@ -214,6 +216,9 @@ pub struct App {
 
     // Phase 10: provider registry for live model switching
     pub registry: ProviderRegistry,
+
+    // Picker modal (OpenCode-style centered selection)
+    pub picker: Picker,
 }
 
 impl App {
@@ -252,6 +257,7 @@ impl App {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             ),
             registry,
+            picker: Picker::inactive(),
         }
     }
 
@@ -487,25 +493,41 @@ impl App {
                 }
             } else if content.starts_with("/compression") {
                 let mode_str = content["/compression".len()..].trim().to_string();
-                self.set_compression(mode_str);
+                if mode_str.is_empty() {
+                    self.open_compression_picker();
+                } else {
+                    self.set_compression(mode_str);
+                }
             } else if content.starts_with("/skills") {
                 let args = content["/skills".len()..].trim().to_string();
-                self.run_skills(args);
+                if args.is_empty() {
+                    self.open_skills_picker();
+                } else {
+                    self.run_skills(args);
+                }
+            } else if content.starts_with("/model") {
+                let args = content["/model".len()..].trim().to_string();
+                if args.is_empty() {
+                    self.open_model_picker();
+                } else {
+                    self.run_model(args);
+                }
+            } else if content.starts_with("/session") {
+                let args = content["/session".len()..].trim().to_string();
+                if args.is_empty() || args == "list" {
+                    self.open_session_picker();
+                } else {
+                    self.run_session(args);
+                }
             } else if content.starts_with("/review") {
                 let args = content["/review".len()..].trim().to_string();
                 self.run_review(args);
             } else if content.starts_with("/commit") {
                 let msg = content["/commit".len()..].trim().to_string();
                 self.run_commit(msg);
-            } else if content.starts_with("/model") {
-                let args = content["/model".len()..].trim().to_string();
-                self.run_model(args);
             } else if content.starts_with("/context") {
                 let text = self.run_context();
                 self.push_system(text);
-            } else if content.starts_with("/session") {
-                let args = content["/session".len()..].trim().to_string();
-                self.run_session(args);
             } else {
                 let trigger = content
                     .split_whitespace()
@@ -606,6 +628,15 @@ impl App {
             Agent::General => Agent::Build,
         };
         self.push_system(format!("Agent switched to: {}", self.agent));
+    }
+
+    fn set_agent(&mut self, name: String) {
+        self.agent = match name.as_str() {
+            "Build"   => Agent::Build,
+            "Plan"    => Agent::Plan,
+            _         => Agent::General,
+        };
+        self.push_system(format!("Agent: {}", self.agent));
     }
 
     // ── Skills command ────────────────────────────────────────────────────────
@@ -765,6 +796,108 @@ impl App {
                 let _ = tx.send(crate::providers::StreamEvent::Done);
             }
         });
+    }
+
+    // ── Picker helpers ────────────────────────────────────────────────────────
+
+    /// Open the centered picker modal.
+    fn open_picker(&mut self, kind: PickerKind, title: impl Into<String>, items: Vec<PickerItem>) {
+        self.picker = Picker::open(kind, title, items);
+        // Also close the slash popup so they don't overlap
+        self.slash_mode.active = false;
+        self.slash_mode.query.clear();
+        self.slash_mode.selected = 0;
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Called when the user presses Enter in the picker — dispatch the chosen value.
+    fn confirm_picker(&mut self) {
+        let Some(item) = self.picker.selected_item().cloned() else { return };
+        let kind = self.picker.kind.clone();
+        self.picker = Picker::inactive();
+
+        match kind {
+            PickerKind::Model => self.run_model(item.value),
+            PickerKind::Agent => self.set_agent(item.value),
+            PickerKind::Compression => self.set_compression(item.value),
+            PickerKind::Session => self.run_session(format!("load {}", item.value)),
+            PickerKind::Skills => self.run_skills(format!("install {}", item.value)),
+        }
+    }
+
+    /// `/agent` — open picker instead of cycling blindly.
+    fn open_agent_picker(&mut self) {
+        let items = vec![
+            PickerItem::new("Build",   "Autonomous build agent",       "Build"),
+            PickerItem::new("Plan",    "Planning + AUDIT agent",       "Plan"),
+            PickerItem::new("General", "General-purpose coding agent", "General"),
+        ];
+        self.open_picker(PickerKind::Agent, "Switch Agent", items);
+    }
+
+    /// `/model` — open picker with all registered providers.
+    fn open_model_picker(&mut self) {
+        let items: Vec<PickerItem> = self.registry.list()
+            .iter()
+            .map(|p| {
+                let hint = if p.id() == self.provider.id() { "active".into() } else { String::new() };
+                PickerItem::new(
+                    format!("{}/{}", p.id(), p.model()),
+                    hint,
+                    p.id().to_string(),
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            self.push_system("[model] No providers configured.");
+            return;
+        }
+        self.open_picker(PickerKind::Model, "Switch Provider", items);
+    }
+
+    /// `/compression` — open picker with all modes.
+    fn open_compression_picker(&mut self) {
+        let items = vec![
+            PickerItem::new("off",    "Normal full responses",            "off"),
+            PickerItem::new("lite",   "Drop filler, keep grammar",        "lite"),
+            PickerItem::new("full",   "Caveman mode — 75% fewer words",   "full"),
+            PickerItem::new("ultra",  "Telegraphic — maximum compression","ultra"),
+            PickerItem::new("wenyan", "Classical Chinese literary style", "wenyan"),
+        ];
+        self.open_picker(PickerKind::Compression, "Compression Mode", items);
+    }
+
+    /// `/skills` with no args — open picker of library skills to browse/install.
+    fn open_skills_picker(&mut self) {
+        let items: Vec<PickerItem> = self.skills.library.iter()
+            .map(|e| PickerItem::new(e.name.clone(), e.purpose.clone(), e.name.clone()))
+            .collect();
+        if items.is_empty() {
+            self.push_system("[skills] No library skills available. Use /skills install <name>.");
+            return;
+        }
+        self.open_picker(PickerKind::Skills, "Browse Skills Library", items);
+    }
+
+    /// `/session` with no args — open picker of saved sessions to load.
+    fn open_session_picker(&mut self) {
+        let store = crate::storage::SessionStore::from_cwd();
+        let ids = match store.list() {
+            Ok(v) => v,
+            Err(e) => {
+                self.push_system(format!("[session] Error listing: {e}"));
+                return;
+            }
+        };
+        if ids.is_empty() {
+            self.push_system("[session] No saved sessions found.  Use /session save first.");
+            return;
+        }
+        let items: Vec<PickerItem> = ids.iter()
+            .map(|id| PickerItem::new(id.clone(), "", id.clone()))
+            .collect();
+        self.open_picker(PickerKind::Session, "Load Session", items);
     }
 
     // ── Slash command dispatch ────────────────────────────────────────────────
@@ -1086,10 +1219,10 @@ impl App {
     fn execute_slash(&mut self, trigger: &str) {
         match trigger {
             "/compression" => {
-                self.set_compression(String::new());
+                self.open_compression_picker();
             }
             "/skills" => {
-                self.run_skills(String::new());
+                self.open_skills_picker();
             }
             "/review" => {
                 self.run_review(String::new());
@@ -1191,7 +1324,7 @@ impl App {
                 self.push_system("Usage: type  /remember <topic>  then press Enter to recall from memory.");
             }
             "/agent" => {
-                self.cycle_agent();
+                self.open_agent_picker();
             }
             "/cancel" => {
                 if let Some(ref mut s) = self.audit_session {
@@ -1203,14 +1336,14 @@ impl App {
                 }
             }
             "/model" => {
-                self.run_model(String::new());
+                self.open_model_picker();
             }
             "/context" => {
                 let text = self.run_context();
                 self.push_system(text);
             }
             "/session" => {
-                self.run_session(String::new());
+                self.open_session_picker();
             }
             other => {
                 self.push_system(format!("Unknown command: {}", other));
@@ -1407,6 +1540,11 @@ fn ui(frame: &mut Frame, app: &App) {
             render_slash_popup(frame, popup_rect, app, &filtered);
         }
     }
+
+    // Centered picker modal — rendered last (highest z-order)
+    if app.picker.active {
+        picker::render(frame, frame.area(), &mut app.picker.clone());
+    }
 }
 
 fn render_slash_popup<'a>(
@@ -1449,6 +1587,18 @@ fn render_slash_popup<'a>(
 // ─── Key handling ─────────────────────────────────────────────────────────────
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // ── Picker modal intercepts all keys when active ──────────────────────
+    if app.picker.active {
+        match key.code {
+            KeyCode::Up    => app.picker.up(),
+            KeyCode::Down  => app.picker.down(),
+            KeyCode::Enter => app.confirm_picker(),
+            KeyCode::Esc   => app.picker = Picker::inactive(),
+            _              => {}
+        }
+        return;
+    }
+
     match (key.modifiers, key.code) {
         // ── Global ────────────────────────────────────────────────────────
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
